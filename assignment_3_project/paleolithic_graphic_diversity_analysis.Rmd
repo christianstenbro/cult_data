@@ -45,6 +45,9 @@ sign_base <- sign_base %>% mutate(feature_count = rowSums(sign_base[,(feature_co
 
 
 ```{r}
+# loading world coordinates
+world_coordinates <- map_data("world") 
+
 # constructing subset with only a single row pr. site
 sign_base_subset <- sign_base %>% group_by(site_name) %>% 
   slice_sample(n=1) %>%
@@ -111,8 +114,6 @@ unique_features_pr_site <- sign_base %>%
 
 # adding this to the sign_base data frame:
 sign_base <- merge(sign_base, unique_features_pr_site, by = "site_name")
-
-sign_base
 ```
 
 ### 1.1 Computing distances between sites
@@ -131,10 +132,11 @@ For this project, I will operationalise the relative isolation/nearness of sites
 
 ```{r}
 # trying out some tests
+geography_matrix <- select(sign_base_subset, longitude, latitude)
 distHaversine(c(geography_matrix$longitude[1], geography_matrix$latitude[1]), c(geography_matrix$longitude[50], geography_matrix$latitude[50]), r=6378137)
 
-sign_base_subset[1,]
-sign_base_subset[50,]
+sign_base_subset[1,]$site_name
+sign_base_subset[50,]$site_name
 ```
 The output is in meters and more or less fits the expectations. For index 1 and 50 (a site in France and a site in Iraq), the Harversine distance is measured to 3703.508 meter. Using Google Earth, I get a result of 3691.83159 meter - hence I decide that this is good enough to use as a basis for the nearest neighbor calculation.
 
@@ -263,8 +265,8 @@ plot(sample_plot)
 One interesting (and potentially problematic) consequence of using the nearest neighbor as a proxy for interconnectivity is demonstrated via the sites "Menton/Grottes du Grimaldi" [index = 41] and "Riparo Bombrini" [index = 48]. Located on opposite sites of the southernmost part of the French/Italian border, the two sites are extremely close (and appears as a single overlapping purple dot. 
 
 ```{r}
-sign_base_subset[48,]
-sign_base_subset[41,]
+sign_base_subset[48,]$site_name
+sign_base_subset[41,]$site_name
 ```
 However, apart from the closeness of each other, the sites are relatively distant from its other nearest neighbors. 
 
@@ -517,6 +519,7 @@ cat(nrow(sign_base) - (nrow(sign_base) - nrow(dated_data)), "out of", nrow(sign_
 
 A new modelling approach using the same data could thus be to focus on the time depth or the duration of site activity as possible predictors of graphic diversity.
 
+
 ## References
 
 Boyd, R., Richerson, P. J., & Henrich, J. (2013). The Cultural Evolution of Technology: Facts and Theories. In P. J. Richerson & M. H. Christiansen (Eds.), Cultural Evolution (pp. 119–142). The MIT Press. https://doi.org/10.7551/mitpress/9894.003.0011
@@ -526,3 +529,5 @@ Kline, M. A., & Boyd, R. (2010). Population size predicts technological complexi
 McElreath, R. (2020). Statistical Rethinking: A Bayesian Course with Examples in R and Stan (Second edition). CRC Press. https://doi.org/10.1201/9780429029608
 
 Blogpost from 'Vibhu's blog': https://www.vibhuagrawal.com/blog/geospatial-nearest-neighbor-search
+
+
