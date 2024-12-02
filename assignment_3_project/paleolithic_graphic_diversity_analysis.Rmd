@@ -516,3 +516,13 @@ cat(nrow(sign_base) - (nrow(sign_base) - nrow(dated_data)), "out of", nrow(sign_
 ```
 
 A new modelling approach using the same data could thus be to focus on the time depth or the duration of site activity as possible predictors of graphic diversity.
+
+## References
+
+Boyd, R., Richerson, P. J., & Henrich, J. (2013). The Cultural Evolution of Technology: Facts and Theories. In P. J. Richerson & M. H. Christiansen (Eds.), Cultural Evolution (pp. 119–142). The MIT Press. https://doi.org/10.7551/mitpress/9894.003.0011
+
+Kline, M. A., & Boyd, R. (2010). Population size predicts technological complexity in Oceania. Proceedings of the Royal Society B: Biological Sciences, 277(1693), 2559–2564. https://doi.org/10.1098/rspb.2010.0452
+
+McElreath, R. (2020). Statistical Rethinking: A Bayesian Course with Examples in R and Stan (Second edition). CRC Press. https://doi.org/10.1201/9780429029608
+
+Blogpost from 'Vibhu's blog': https://www.vibhuagrawal.com/blog/geospatial-nearest-neighbor-search
