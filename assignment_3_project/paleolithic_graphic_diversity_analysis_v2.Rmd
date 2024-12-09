@@ -46,6 +46,11 @@ sign_base <- merge(sign_base, unique_features_pr_site, by = "site_name")
 ```
 
 ```{r}
+# constructing subset with only a single row pr. site
+sign_base_subset <- sign_base %>% group_by(site_name) %>% 
+  slice_sample(n=1) %>%
+  ungroup
+
 # observing the distribution of features
 simplehist(sign_base_subset$unique_features,
            xlab = "Unique features")
@@ -55,11 +60,6 @@ simplehist(sign_base_subset$unique_features,
 ```{r}
 # loading world coordinates
 world_coordinates <- map_data("world") 
-
-# constructing subset with only a single row pr. site
-sign_base_subset <- sign_base %>% group_by(site_name) %>% 
-  slice_sample(n=1) %>%
-  ungroup
 
 # determining the bounds for zooming
 padding_factor <- 0.2
