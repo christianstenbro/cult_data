@@ -1,0 +1,517 @@
+---
+title: "A model of graphic diversity in marks on paleolithic artefacts based on distance to neighboring sites"
+author: "Christian Stenbro"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## 0. Set-up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# importing packages
+pacman::p_load(tidyverse,
+               ggplot2,
+               ggrepel,
+               spatstat.geom,
+               viridis,
+               nngeo,
+               geosphere,
+               rethinking)
+```
+
+## 1. Initial data processing and visualisation of the archeological sites
+
+Importing data:
+
+```{r}
+# importing sign base
+sign_base <- read_csv("/Users/christianstenbro/AU/5_sem/Cultural Data Science/Geometric Signs Project/data/signBase_Version1.0.csv")
+```
+
+```{r}
+# composing a vector with all feature variable names
+feature_columns <- colnames(sign_base)[25:55]
+
+# computing the number of unique features pr. site
+unique_features_pr_site <- sign_base %>% 
+  group_by(site_name) %>% 
+  summarise(unique_features = sum(colSums(across(feature_columns)) > 0))
+
+# adding this to the sign_base data frame:
+sign_base <- merge(sign_base, unique_features_pr_site, by = "site_name")
+```
+
+```{r}
+# constructing subset with only a single row pr. site
+sign_base_subset <- sign_base %>% group_by(site_name) %>% 
+  slice_sample(n=1) %>%
+  ungroup
+
+# observing the distribution of features
+simplehist(sign_base_subset$unique_features,
+           xlab = "Unique features")
+```
+
+```{r}
+# loading world coordinates
+world_coordinates <- map_data("world") 
+
+# determining the bounds for zooming
+padding_factor <- 0.2
+long_range <- range(sign_base_subset$longitude, na.rm = TRUE)
+lat_range <- range(sign_base_subset$latitude, na.rm = TRUE)
+
+# expand the range by a fixed percentage
+long_range <- c(
+  long_range[1] - diff(long_range) * padding_factor,
+  long_range[2] + diff(long_range) * padding_factor
+)
+lat_range <- c(
+  lat_range[1] - diff(lat_range) * padding_factor,
+  lat_range[2] + diff(lat_range) * padding_factor
+)
+
+# creating plot
+sample_plot <- ggplot() + 
+  geom_map(
+    data = world_coordinates, map = world_coordinates,
+    aes(long, lat, map_id = region),
+    color = "lightblue3", fill = "lightblue1"
+  ) +
+  geom_point(
+    data = sign_base_subset,
+    aes(longitude, latitude),
+    size = 1.5,
+    alpha = 0.7
+  ) +
+  geom_text_repel(
+    data = sign_base_subset,
+    aes(longitude, latitude, label = site_name),
+    size = 2,
+    max.overlaps = Inf,
+    box.padding = 0.2,
+    point.padding = 0.2,
+    segment.color = "grey50",
+    segment.size = 0.2
+  ) +
+  coord_cartesian(
+    xlim = long_range,
+    ylim = lat_range
+  ) + 
+  theme(
+    legend.position = "none",
+    plot.margin = margin(4, 4, 4, 4),
+    panel.grid.major = element_line(color = "lightblue", linetype = "dotted"),
+    panel.grid.minor = element_line(color = "lightblue", linetype = "dotted")
+  ) +
+  ggtitle("All Sites Plotted on Map (with labels)")
+
+print(sample_plot)
+```
+
+### 1.1 Computing distances between sites
+
+The first task is to compute a new variable, encoding the geographic distance between sites. The distances will be logged to counter the extreme isolation of certain sites. 
+
+It is important to notice that this process introduces a number of assumptions which are likely not completely sound - namely, whereas the map would suggest that certain sites are isolated, this appearance is likely a result of data sparsity and not necessarily a reflection of the true isolation or connectivity of the sites.
+
+Another assumption that would not fare well if placed under scrutiny, is that adjacent sites necessarily had contact. Another obvious problem is that the artefacts are from different time periods. 
+
+While these assumptions compromise the validity of the model, the data can still be used to demonstrate the methodological idea of using geographical distances as a proxy for inter-site connectedness, and to use this a predictor variable in a regression model used to predict graphic diversity (operationalised as the number of distinct features observed on artefacts from each site).
+
+This model is inspired by the paper from Boyd et al., 2013, where they cite research finding a statistical relationship between the population size of different island societies in Oceania and the number of distinct marine foraging tools used by each population (Kline and Boyd, 2010). This supports theoretical models of the cultural evolution of technology, predicting that larger populations with more contact to other populations *"(...) will have more diverse and more complex toolkits than small, isolated populations"*.  (Boyd et al., 2013, pp. 18).
+
+For this project, I will operationalise the relative isolation/nearness of sites as the *mean distance to the k-nearest neighbors*. Here, it is important to consider which distance measure to base the nearest neighbor search on. Following this post: https://www.vibhuagrawal.com/blog/geospatial-nearest-neighbor-search, I will use the Harversine method. There is an implementation for this method in the 'geosphere' R package:
+
+```{r}
+# trying out some tests
+geography_matrix <- select(sign_base_subset, longitude, latitude)
+distHaversine(c(geography_matrix$longitude[1], geography_matrix$latitude[1]), c(geography_matrix$longitude[50], geography_matrix$latitude[50]), r=6378137)
+
+sign_base_subset[1,]$site_name
+sign_base_subset[50,]$site_name
+```
+
+The output is in meters and more or less fits the expectations. For index 1 and 50 (a site in France and a site in Iraq), the Harversine distance is measured to 3703.508 meter. Using Google Earth, I get a result of 3691.83159 meter - hence I decide that this is good enough to use as a basis for the nearest neighbor calculation.
+
+Now, the Harversine distance should be plotted into a nearest neighbor algorithm. As a first test, I wil consider a "brute-force" method (again following the blogpost:  https://www.vibhuagrawal.com/blog/geospatial-nearest-neighbor-search). In this approach, all distances between all points are decided, and the k number of points with the smallest distances are selected as neighbors. 
+
+The method is simple to conceptualize (and implement), but can be computationally expense. However, given the size of the data set (65 individual sites), I estimate that this is very possible.
+
+First, we need to make a matrix with distances calculated for each possible pair:
+
+```{r}
+# defining earth radius
+earth = 6378137
+
+# setting up a empty vector of lists to store distance computations
+data_structure <- vector("list", nrow(sign_base_subset))
+
+# looping through the archaeological sites
+for (i in 1:nrow(sign_base_subset)) {
+  
+  lon_site_1 <- sign_base_subset[i,]$longitude
+  lat_site_1 <- sign_base_subset[i,]$latitude
+
+  p1 <- c(lon_site_1, lat_site_1)
+  
+  distances <- numeric(nrow(sign_base_subset))
+  
+  # for each site, the Haversine distance to all other sites is computed
+    for (j in 1:nrow(sign_base_subset)) {
+  
+      lon_site_2 <- sign_base_subset[j,]$longitude
+      lat_site_2 <- sign_base_subset[j,]$latitude
+  
+      p2 <- c(lon_site_2, lat_site_2)
+  
+      distances[j] <- distHaversine(p1, p2, r = earth)
+   }
+
+# the distance data for site i is then stored as one of the lists in the nested list structure
+data_structure[[i]] <- distances
+  
+}
+```
+
+Testing the composition of the distance matrix:
+
+```{r}
+# now, we can test if the matrix has the desired information
+distance_matrix <- data_structure
+
+# retrieving the distance between site 1 and 2 in the matrix
+distance_matrix[[1]][2]
+
+# computing this distance manually
+distHaversine(c(geography_matrix$longitude[1], geography_matrix$latitude[1]), c(geography_matrix$longitude[2], geography_matrix$latitude[2]), r=6378137)
+
+# the two are identical, which indicates that the matrix stores the correct information
+distance_matrix[[1]][2] == distHaversine(c(geography_matrix$longitude[1], geography_matrix$latitude[1]), c(geography_matrix$longitude[2], geography_matrix$latitude[2]), r=6378137)
+
+```
+
+The single nearest neighbor can now be found through the following simple operations:
+
+```{r}
+# first, an empty list is created to store the results
+nn_list <- list()
+
+# then a for loop is made to find this value for all unique sites
+for (i in 1:nrow(sign_base_subset)) {
+  
+  # creating a subset of distances for the site i
+  distances_i <- distance_matrix[[i]]
+  
+  # finding the smallest non-zero distance
+  nn_list[i] <- min(distances_i[distances_i > 0])
+}
+
+nn_list <- unlist(unname(nn_list))
+
+# this can now be appended to the sign base subset
+sign_base_subset$nearest_neighbor <- nn_list
+
+# and we can assess the list of nearest neighbors (here rounded for readability)
+round(sign_base_subset$nearest_neighbor, digits = 2)
+```
+Notice that some values will be paired - this makes sense in the case where the nearest neighbor of site x is also the nearest neighbor of site y!
+
+We can now plot the sites, coloring them by the nearest neighbor. First, I will log the values to decrease the range and mitigate the extreme values for the most isolated sites (relative to the rest):
+
+```{r}
+sign_base_subset <- sign_base_subset %>% mutate(log_nearest_neighbor = log(nearest_neighbor))
+```
+Then, the sites are plotted:
+
+```{r}
+sample_plot <- ggplot() + 
+  geom_map(
+    data = world_coordinates, map = world_coordinates,
+    aes(long, lat, map_id = region),
+    color = "lightblue3", fill = "lightblue1"
+  ) +
+  geom_point(
+    data = sign_base_subset,
+    aes(longitude, latitude, color = scale(log_nearest_neighbor)),
+    size = 1,
+    alpha = 0.7
+  ) +
+  coord_cartesian(
+    xlim = long_range,
+    ylim = lat_range
+  ) + 
+  theme(
+    legend.position = c(0.90, 0.80),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title = element_text(size = 10, face = "bold"),
+    plot.margin = margin(4, 4, 4, 4),
+    panel.grid.major = element_line(color = "lightblue", linetype = "dotted"),
+    panel.grid.minor = element_line(color = "lightblue", linetype = "dotted")
+  ) + 
+  viridis::scale_color_viridis() +
+  labs(color = "Distance (scaled)") +
+  ggtitle("Sites colored by the logged distance to the single nearest neighbor")
+
+plot(sample_plot)
+```
+One interesting (and potentially problematic) consequence of using the nearest neighbor as a proxy for interconnectivity is demonstrated via the sites "Menton/Grottes du Grimaldi" [index = 41] and "Riparo Bombrini" [index = 48]. Located on opposite sites of the southernmost part of the French/Italian border, the two sites are extremely close (and appears as a single overlapping purple dot. 
+
+```{r}
+sign_base_subset[48,]$site_name
+sign_base_subset[41,]$site_name
+```
+However, apart from the closeness of each other, the sites are relatively distant from its other nearest neighbors. 
+
+To mitigate this issue, it could be neat to incorporate the distance to not only the nearest neighbor but the *k* nearest neighbors. Or, alternatively take the mean distance from point x to all other points?
+
+```{r}
+# trying out taking the mean of all distances
+distance_matrix_1 <- distance_matrix[[1]]
+distance_matrix_2 <- distance_matrix[[2]]
+distance_matrix_48 <- distance_matrix[[48]]
+
+mean(round(log(distance_matrix_1[distance_matrix_1 > 0])))
+mean(round(log(distance_matrix_2[distance_matrix_2 > 0])))
+mean(round(log(distance_matrix_48[distance_matrix_48 > 0])))
+```
+
+```{r}
+# trying out taking the mean of the three nearest neighbors
+distance_matrix_1 <- sort(distance_matrix[[1]])
+mean(round(log(distance_matrix_1[2:4])))
+
+distance_matrix_48 <- sort(distance_matrix[[48]])
+mean(round(log(distance_matrix_48[2:4])))
+```
+
+Based on this test, it seems that taking the mean of the distance to the three nearest neighbors reflects the relative isolation of site 48 better than taking the mean of all distances. Hence, I will go with this approach.
+
+```{r}
+# setting up a loop to compute mean distance to the k nearest neighbors
+k = 3
+
+knn_list <- list()
+
+# then a for loop is made to find this value for all unique sites
+for (i in 1:nrow(sign_base_subset)) {
+  
+  # creating a subset of sorted distances for the site i
+  distances_i <- sort(distance_matrix[[i]])
+  
+  # finding the k nearest neighbors (notice that the first index is always the site itself due to the sorting)
+  knn_list[i] <- mean(distances_i[2:(k+1)])
+}
+
+knn_list <- unlist(unname(knn_list))
+
+# this can now be appended to the sign base subset. Notice that the variable is logged before storage.
+sign_base_subset$k_nearest_neighbor <- log(knn_list)
+
+# and we can assess the list of nearest neighbors (here rounded for readability)
+round(sign_base_subset$k_nearest_neighbor, digits = 2)
+```
+
+```{r}
+# visualizing
+sample_plot <- ggplot() + 
+  geom_map(
+    data = world_coordinates, map = world_coordinates,
+    aes(long, lat, map_id = region),
+    color = "lightblue3", fill = "lightblue"
+  ) +
+  geom_point(
+    data = sign_base_subset,
+    aes(longitude, latitude, color = scale(k_nearest_neighbor)),
+    size = 1.5,
+    alpha = 0.8
+  ) +
+  coord_cartesian(
+    xlim = long_range,
+    ylim = lat_range
+  ) + 
+  theme(
+    legend.position = c(0.90, 0.80),
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.key.size = unit(0.5, "cm"),
+    legend.title = element_text(size = 10, face = "bold"),
+    plot.margin = margin(4, 4, 4, 4),
+    panel.grid.major = element_line(color = "lightblue", linetype = "dotted"),  # Major grid: red and dashed
+    panel.grid.minor = element_line(color = "lightblue", linetype = "dotted")
+  ) + 
+  #scale_color_gradient2(low="blue", mid="green", high = "red") +
+  labs(color = "Distance (scaled)") +
+  viridis::scale_color_viridis() +
+  ggtitle("Sites colored by the logged mean distance to the 3 nearest neighbors")
+
+plot(sample_plot)
+```
+
+The visualisation based on the weighting by k nearest neighbors matches the intuitive estimation of the relative isolation of sites better than the previous attempts. Hence, this measure will be used for the statistical model in part 3.
+
+## 3. Making a regression model of graphic feature diversity based on distance to neighboring sites
+
+### 3.1 Specifying the model
+
+For the analysis, I am interested in estimating the relationship between the *feature_count* of an archaeological site and its relative closeness to other sites, operationalised via the *logged distance to k_nearest_neighbor* variable computed in section 2. Since the outcome variable is a count variable, I will model it as a Poisson distribution.
+
+I will fit the model using the Bayesian framework *ulam*. This means that I need to decide on priors for the alpha and beta estimates. In *Statistical Rethinking* (McElreath, 2020), the author fits a very similar Poisson model, using the data from Kline and Boyd, 2010. He also describes how one can go about setting priors for this kind of model. 
+
+But before deciding on priors, I will formalize the model:
+
+Variables:
+$$F_i = \text{Unique Features}$$
+$$D_i = \text{Standardised Log Distance to K-nearest Neighbors}$$
+The model can now be described as:
+$$F_i \sim \text{Poisson}(\lambda_i)  $$
+$$log \lambda_i = \alpha + \beta \cdot D_i$$
+$$\alpha \sim \text{some prior}$$
+$$\beta \sim \text{some prior}$$
+### 3.2 Selecting priors
+
+As McElreath points out, due to the log transformation implicit in the Poisson model (we model the log of the parameter Lambda as a linear function of the predictor variable), it is important to assess how a normally distributed prior on alpha will implicate the log normal distribution of Lambda (McElreath, 2020, p. 356). 
+
+In this case, Lambda is a stand in for the number of distinct graphic features observed at an archaeological site. I would assume this to be somewhere between 1 (0 is out of the question since all the observations are based on artefacts with a graphic mark) and some upper limit for realistic diversity. This limit could be 30, which is the number of features possible in this specific data set. But realistically, an upper limit should be set higher to account for possible unobserved features still to be included in the data set, for example from excavations at other sites or deeper time periods.
+
+Similarly, it is important to think about the expectations for the beta coefficient, which reflects the possible relationships between the relative closeness to other sites (as a proxy for interconnectivity) and the observed graphic diversity. Based on the theory informing the model (summarized in Boyd et al., 2013) I would expect a *moderately negative relationship* between the variables, as contact between groups is hypothesized to increase the cultural evolution of technological artefacts (a set which graphic marks are here assumed to belong to). Concretely, when distance is taken as a proxy for interconnectivity between groups, increases in log distance would be expected to decrease the total feature count.
+
+Following McElreath's example, I will put relatively restrictive priors on both alpha and beta, and then plot the distributions and relationships in the outcome (log) space. This code is reproduced more or less exactly from McElreath's analysis on pp. 356-358 (with changed parameters):
+
+```{r}
+# we can compute a mean to base the alpha prior on as the exp( mu + sigma^2 / 2 )
+# using 1 as mu and 0.5 as sigma would create a mean in the log normal space of the outcome variable of:
+exp(1 + 0.5^2 / 2)
+```
+
+```{r}
+# plotting this prior for alpha in log normal space
+curve(dlnorm( x , 1 , 0.5 ) , from=0 , to=10 , n=200)
+```
+Here, x represents the mean graphic features of a given site. This is an OK prior, if perhaps a bit too restrictive (not a lot of density for higher feature). Let us try with a mu of 1.5 instead:
+
+```{r}
+cat("Mean graphic features:", exp(1.5 + 0.5^2 / 2))
+```
+
+```{r}
+curve(dlnorm( x , 1.5 , 0.5 ) , from=0 , to=10 , n=200)
+```
+
+This looks better - the distribution is a bit wider and has more density for possible higher feature counts.
+
+And for the beta prior:
+
+```{r}
+N <- 100
+a <- rnorm( N , 1.5 , 0.5 )
+b <- rnorm( N , 0 , 0.5 )
+plot( NULL , xlim=c(-2,2) , ylim=c(0,80),
+      xlab = "Standardised log distance to nearest neighbors",
+      ylab = "Number of distinct graphic features")
+for ( i in 1:N ) curve( exp( a[i] + b[i]*x ) , add=TRUE , col=grau() )
+```
+
+This looks like a reasonable prior, as most of the relationships are within a moderate range.
+
+### 3.3 Fitting model
+
+I will now go ahead and fit the model. Before fitting, I will standardize the logged distance to the k-nearest neighbors.
+
+
+```{r}
+set.seed(2025)
+
+# selecting and transforming variables 
+dat <- list(
+  F = sign_base_subset$unique_features ,
+  D = scale(sign_base_subset$k_nearest_neighbor) # this variable has already been logged earlier
+  )
+
+m1.1 <- ulam(
+  alist(
+    F ~ dpois( lambda ),
+    log(lambda) <- a + b*D,
+    a ~ dnorm(1.5, 0.5),
+    b ~ dnorm(0, 0.5)
+  ), data=dat , chains=4 , log_lik=TRUE )
+```
+We can now look at the summary of the posterior distributions:
+
+```{r}
+precis(m1.1)
+
+# saving the summary
+model_summary <- precis(m1.1)
+setwd("/Users/christianstenbro/AU/5_sem/Cultural Data Science/cult_data/assignment_3_project/model_summary")
+write_csv(model_summary, "model_1_1_summary_seed_2025.csv")
+```
+
+And then we can plot the posterior distribution for the beta coefficient:
+
+```{r}
+post <- extract.samples( m1.1 )
+density_interval <- HPDI(post$b, prob = 0.89)
+
+dens(post$b, xlab = "beta estimates", main="Distribution of beta estimates from mdl 1") # plotting the posterior distribution
+abline(v = mean(post$b), lty = 2) # plotting the mean
+abline(v = c(density_interval[[1]], density_interval[[2]]), lty = 2, col = "grey") # plotting the highest posterior density intervals
+```
+
+The bulk of the distribution (demarcated by the HPDI, indicated with grey lines) is in the negative range between -0.4 and -0.2, indicating a reliable negative correlation between the distance of a site and the number of graphic features observed at the site.
+
+It is easier to interpret in the scale of the data if we take the exponential of the coefficients:
+
+```{r}
+# the intercept is the baseline graphic diversity when log distance = 0
+exp(coef(m1.1)[[1]])
+
+# we can now build an intuition for how the model predicts changes in unique features as the log distance varies (here without accounting for error)
+d <- c(seq(-2,2, 0.5))
+predicted_features <- exp(coef(m1.1)[[1]]+(d*coef(m1.1)[[2]]))
+print(round(predicted_features, digits = 3))
+```
+
+While the coefficients are hard to interpret within the model, the above computation returns them to the scale of the data. We can see that the model predicts decreasing feature counts as the log distance to the three nearest sites increases!
+
+Plotting regression lines informed by the posterior distribution:
+
+```{r}
+# creating jitter
+jitt = rnorm(length(dat$F), mean = 0, sd = 0.05)
+
+plot( x = dat$D , y = dat$F + jitt, 
+      xlab="std. log distance to neighbooring sites" , 
+      ylab="distinct graphic features" ,
+      main="Model predictions plotted against the data",
+    col=col.alpha(rangi2, 0.8) , lwd=2 ,
+    ylim=c(0,max(dat$F+1)) )
+# setting up a grid of hypothetical log distance values to base the predictions on
+resolution <- 100
+D_seq <- seq( from=min(dat$D) , to=max(dat$D) , length.out=resolution )
+
+# computing predictions for the grid values
+lambda <- link( m1.1 , data=data.frame( D=D_seq ) )
+lmu <- apply( lambda , 2 , mean )
+lci <- apply( lambda , 2 , PI )
+lines( D_seq , lmu , lty=1 , lwd=1.5 )
+shade( lci , D_seq , xpd=TRUE )
+```
+
+For comments and discussions of the model results, see the discussion section of the report. 
+
+## References
+
+Boyd, R., Richerson, P. J., & Henrich, J. (2013). The Cultural Evolution of Technology: Facts and Theories. In P. J. Richerson & M. H. Christiansen (Eds.), Cultural Evolution (pp. 119–142). The MIT Press. https://doi.org/10.7551/mitpress/9894.003.0011
+
+Kline, M. A., & Boyd, R. (2010). Population size predicts technological complexity in Oceania. Proceedings of the Royal Society B: Biological Sciences, 277(1693), 2559–2564. https://doi.org/10.1098/rspb.2010.0452
+
+McElreath, R. (2020). Statistical Rethinking: A Bayesian Course with Examples in R and Stan (Second edition). CRC Press. https://doi.org/10.1201/9780429029608
+
+Blogpost from 'Vibhu's blog': https://www.vibhuagrawal.com/blog/geospatial-nearest-neighbor-search
+
+
